@@ -8,7 +8,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Unzip project
-        run: unzip -q "*.zip"
+        run: unzip -q -o "*.zip"
+      - name: Apply override
+        run: |
+          if [ -f override/Detector.kt ]; then
+            cp override/Detector.kt AimOverlay/app/src/main/java/com/aimoverlay/Detector.kt
+          fi
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -17,9 +22,10 @@ jobs:
         with:
           gradle-version: 8.7
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
         working-directory: AimOverlay
+        run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: AimOverlay-apk
           path: AimOverlay/app/build/outputs/apk/debug/app-debug.apk
+          
