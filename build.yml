@@ -1,0 +1,149 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack code.zip
+        run: |
+          if [ ! -f code.zip ]; then echo "::error::code.zip is missing from repo root"; exit 1; fi
+          mkdir -p override && unzip -o code.zip -d .
+      - name: Verify code files
+        run: |
+          bad=0
+          check() {
+            f="$1"; want="$2"; wantn="$3"
+            if [ ! -f "$f" ]; then echo "::error::MISSING FILE $f"; bad=1; return; fi
+            got=$(tr -d ' \t\r\n' < "$f" | sha256sum | cut -d' ' -f1)
+            n=$(tr -d ' \t\r\n' < "$f" | wc -c)
+            if [ "$got" != "$want" ]; then echo "::error::FILE $f IS WRONG OR CUT OFF (has $n chars, expected $wantn)"; bad=1; fi
+          }
+          check override/D1.txt e3dbbba2161ba0091cde0b8ccfddd1b765029efe80ea6a51be82b612493f7494 11595
+          check override/D2.txt 8b98b74e285731cba34011c5eb249c80a85f09073f3337da68183bd038f059d1 7484
+          check override/R1.txt 8d0161ef7d95de0d8c37a200e683dd363e914f0d6caa5c739b0516735ccb7f9a 9853
+          check override/R2.txt c17974c5b98d1b94f0cdf78373a16ac7357955fe65390b326eedfcebbb994388 9536
+          if [ $bad -ne 0 ]; then exit 1; fi
+          echo "All 4 code files verified"
+      - name: Assemble project
+        run: |
+          mkdir -p AimOverlay/app/src/main/java/com/aimoverlay AimOverlay/app/src/main/res/values
+          cd AimOverlay
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "AimOverlay"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.aimoverlay"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.aimoverlay"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.1")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">خط التصويب</string>
+          </resources>
+          EOF
+          { cat ../override/D1.txt; echo; cat ../override/D2.txt; echo; } > app/src/main/java/com/aimoverlay/Detector.kt
+          { cat ../override/R1.txt; echo; cat ../override/R2.txt; echo; } > app/src/main/java/com/aimoverlay/Rest.kt
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build debug APK
+        working-directory: AimOverlay
+        run: |
+          set +e
+          gradle assembleDebug --no-daemon > build.log 2>&1
+          code=$?
+          grep -E '^e: ' build.log | head -12 | while IFS= read -r l; do echo "::error::$l"; done
+          if [ $code -ne 0 ] && ! grep -qE '^e: ' build.log; then
+            grep -A8 'What went wrong' build.log | head -14 | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit $code
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AimOverlay-apk
+          path: AimOverlay/app/build/outputs/apk/debug/app-debug.apk
