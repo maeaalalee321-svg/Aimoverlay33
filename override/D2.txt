@@ -1,0 +1,283 @@
+            var cur = phi
+            var mx = gx
+            var my = gy
+            var n = 0
+            var ok = true
+            for (iter in 0 until 3) {
+                val dx0 = cos(cur); val dy0 = sin(cur)
+                var sx = 0.0; var sy = 0.0; var k = 0
+                for (i in 0 until total) {
+                    val vx = xs[i] - mx; val vy = ys[i] - my
+                    val inb = vx * dx0 + vy * dy0 > -2f * r && abs(vx * dy0 - vy * dx0) <= 2.8f
+                    band[i] = inb
+                    if (inb) { sx += xs[i]; sy += ys[i]; k++ }
+                }
+                if (k < 8) { ok = false; break }
+                val mxx = sx / k; val myy = sy / k
+                var sxx = 0.0; var syy = 0.0; var sxy = 0.0
+                for (i in 0 until total) if (band[i]) {
+                    val ddx = xs[i] - mxx; val ddy = ys[i] - myy
+                    sxx += ddx * ddx; syy += ddy * ddy; sxy += ddx * ddy
+                }
+                var th = (0.5 * atan2(2.0 * sxy, sxx - syy)).toFloat()
+                if (cos(th) * dx0 + sin(th) * dy0 < 0f) th += Math.PI.toFloat()
+                cur = atan2(sin(th), cos(th))
+                mx = mxx.toFloat(); my = myy.toFloat()
+                n = k
+            }
+            if (!ok) continue
+            val dxf = cos(cur); val dyf = sin(cur)
+            var amin = Float.MAX_VALUE
+            var amax = -Float.MAX_VALUE
+            for (i in 0 until total) {
+                val vx = xs[i] - mx; val vy = ys[i] - my
+                if (vx * dxf + vy * dyf > -2f * r && abs(vx * dyf - vy * dxf) <= 2.8f) {
+                    val al = (xs[i] - gx) * dxf + (ys[i] - gy) * dyf
+                    if (al < amin) amin = al
+                    if (al > amax) amax = al
+                }
+            }
+            dbg += " [n=$n ext=${((amax - amin) / r * 10).toInt() / 10f} ang=${Math.toDegrees(cur.toDouble()).toInt()} fwd=${dxf * ux + dyf * uy}]"
+            if (n < 24 || amax - amin < r) continue
+            if (dxf * ux + dyf * uy < 0.02f) continue             // الكرة الهدف تتحرك للأمام دائماً
+            if (n > bestN) {
+                bestN = n
+                val tt = (gx + 2f * r * dxf - mx) * dxf + (gy + 2f * r * dyf - my) * dyf
+                res = floatArrayOf(dxf, dyf, mx + dxf * tt, my + dyf * tt)
+            }
+        }
+        return res
+    }
+
+    /**
+     * مركز الكرة الشبحية بدقة: الحلقة البيضاء دائرة نصف قطرها r. نبحث على امتداد خط التصويب
+     * عن الموضع الذي تقع عنده أكثر نقاط الحلقة على بكسلات بيضاء. (نهاية الخط الأبيض وحدها
+     * تتجاوز الحلقة أحياناً بنصف قطر أو أكثر فتُخطئ اتجاه الكرة الهدف.)
+     * يرجع المسافة من مركز الكرة البيضاء إلى مركز الحلقة، أو g0 إن لم تُوجد.
+     */
+    private fun fitGhost(
+        px: IntArray, w: Int, h: Int, cx: Float, cy: Float, ux: Float, uy: Float, r: Float, g0: Float
+    ): Float {
+        val ns = 36
+        val cs = FloatArray(ns) { cos(it * 2f * Math.PI.toFloat() / ns) * r }
+        val sn = FloatArray(ns) { sin(it * 2f * Math.PI.toFloat() / ns) * r }
+        var best = -1
+        var t = g0 - 3.2f * r
+        val ts = ArrayList<Float>()
+        val cnt = ArrayList<Int>()
+        while (t <= g0 + 0.6f * r) {
+            if (t > 2.2f * r) {
+                val gx = cx + ux * t; val gy = cy + uy * t
+                var c = 0
+                for (j in 0 until ns) {
+                    val xx = (gx + cs[j] + 0.5f).toInt(); val yy = (gy + sn[j] + 0.5f).toInt()
+                    var hit = false
+                    for (oy in -1..1) {
+                        for (ox in -1..1) {
+                            val x = xx + ox; val y = yy + oy
+                            if (x in 0 until w && y in 0 until h && isWhiteStrict(px[y * w + x])) { hit = true; break }
+                        }
+                        if (hit) break
+                    }
+                    if (hit) c++
+                }
+                ts.add(t); cnt.add(c)
+                if (c > best) best = c
+            }
+            t += 0.5f
+        }
+        if (best < 22) return g0
+        var sum = 0f
+        var n = 0
+        for (i in ts.indices) if (cnt[i] >= best - 1) { sum += ts[i]; n++ }
+        return if (n > 0) sum / n else g0
+    }
+
+    /**
+     * مطابقة قالب: الكرة الهدف قرص نصف قطره r مركزه على بعد 2r من مركز الحلقة في اتجاه φ.
+     * نختار φ التي يحوي قرصها أكثر بكسلات «كرة» وأقل بكسلات قماش. مستقلة عن تحيّز الحواف.
+     * يرجع [cosφ, sinφ, score] أو null.
+     */
+    private fun templateContact(
+        px: IntArray, w: Int, h: Int, tb: FloatArray, r: Float, gx: Float, gy: Float, ux: Float, uy: Float
+    ): FloatArray? {
+        val base = atan2(uy, ux)
+        val rr = 0.9f * r
+        val skip2 = 1.35f * r * 1.35f * r
+        val sc = FloatArray(181)
+        var best = -2f
+        var bi = 0
+        for (k in 0..180) {
+            val phi = base + (k - 90) * 0.0174533f
+            val cx = gx + 2f * r * cos(phi)
+            val cy = gy + 2f * r * sin(phi)
+            // مركز كرة لا يمكن أن يقع في حزام الحافة (الظل والميل يشبهان الكرة بلونهما)
+            if (cx < tb[0] + 2.55f * r || cx > tb[2] - 2.55f * r || cy < tb[1] + 2.55f * r || cy > tb[3] - 2.55f * r) {
+                sc[k] = -2f
+                continue
+            }
+            val y0 = max(0, (cy - rr).toInt()); val y1 = min(h - 1, (cy + rr).toInt() + 1)
+            val x0 = max(0, (cx - rr).toInt()); val x1 = min(w - 1, (cx + rr).toInt() + 1)
+            var sum = 0
+            var n = 0
+            for (y in y0..y1) for (x in x0..x1) {
+                val dx = x - cx; val dy = y - cy
+                if (dx * dx + dy * dy > rr * rr) continue
+                val ex = x - gx; val ey = y - gy
+                if (ex * ex + ey * ey < skip2) continue
+                if (x < tb[0] + 1.55f * r || x > tb[2] - 1.55f * r || y < tb[1] + 1.55f * r || y > tb[3] - 1.55f * r) continue   // وجه الحافة
+                val c = px[y * w + x]
+                n++
+                sum += if (isFelt(c)) -1 else if (isWhite(c) || isOverlayColor(c) || nearExcl(x.toFloat(), y.toFloat())) 0 else 1
+            }
+            val v = if (n < 40) -2f else sum.toFloat() / n
+            sc[k] = v
+            if (v > best) { best = v; bi = k }
+        }
+        if (best < 0.15f) return null
+        var sx = 0.0; var sy = 0.0
+        for (k in max(0, bi - 25)..min(180, bi + 25)) if (sc[k] >= best - 0.03f) {
+            val phi = base + (k - 90) * 0.0174533f
+            sx += cos(phi); sy += sin(phi)
+        }
+        val a = atan2(sy, sx).toFloat()
+        return floatArrayOf(cos(a), sin(a), best)
+    }
+
+
+    // ------------------------------------------------------------ الواجهة
+
+    fun detect(px: IntArray, w: Int, h: Int): Detection? {
+        if (w != lastW || h != lastH) { reset(); lastW = w; lastH = h }
+
+        tableAge++
+        if (table == null || tableAge > 40) {
+            val t = findTable(px, w, h)
+            if (t != null) {
+                val old = table
+                val same = old != null && abs(old[0] - t[0]) < 3f && abs(old[1] - t[1]) < 3f &&
+                        abs(old[2] - t[2]) < 3f && abs(old[3] - t[3]) < 3f
+                if (!same) table = t
+                tableAge = 0
+            } else if (table == null) { status = "لا طاولة"; return null } else tableAge = 30
+        }
+        val tb = table ?: return null
+        val tw = tb[2] - tb[0]
+        if (tw < w * 0.4f) { table = null; status = "لا طاولة"; return null }
+        val r = tw * 0.0136f
+
+        var ball = if (pBx >= 0f) trackBall(px, w, h, pBx, pBy, r) else null
+        if (ball == null) ball = findCueBall(px, w, h, tb, r)
+        if (ball == null) { pBx = -1f; hasAng = false; status = "لا كرة بيضاء"; return null }
+        val cx = ball[0]
+        val cy = ball[1]
+        pBx = cx; pBy = cy
+
+        // بحث خشن كل 2 درجة بطول محدود، ثم دقيق حول الأفضل
+        val start = r * 1.5f
+        val coarseMax = min(tw * 0.2f, 170f)
+        val step = (2.0 * Math.PI / 180.0).toFloat()
+        var ca = 0f
+        var bestC = -1f
+        for (i in 0 until 180) {
+            val a = i * step
+            val e = rayEnd(px, w, h, cx, cy, a, start, coarseMax)
+            if (e > bestC) { bestC = e; ca = a }
+        }
+        if (bestC - start < r * 1.5f) {
+            hasAng = false; hasGd = false; pBx = -1f
+            status = "لا خط تصويب (كرة ${cx.toInt()},${cy.toInt()} طول ${((bestC - start) / r * 10).toInt() / 10f}R)"
+            return null
+        }
+        if (hasAng) {
+            val ep = rayEnd(px, w, h, cx, cy, pAng, start, coarseMax)
+            if (ep - start >= 0.85f * (bestC - start)) ca = pAng
+        }
+
+        val maxD = tw * 0.9f
+        val fine = 17
+        val ends = FloatArray(fine)
+        val fstep = (0.25 * Math.PI / 180.0).toFloat()
+        var bestE = -1f
+        for (k in 0 until fine) {
+            val a = ca + (k - fine / 2) * fstep
+            ends[k] = rayEnd(px, w, h, cx, cy, a, start, maxD)
+            if (ends[k] > bestE) bestE = ends[k]
+        }
+        if (bestE - start < r * 2f) {
+            hasAng = false; hasGd = false; pBx = -1f
+            status = "خط قصير (كرة ${cx.toInt()},${cy.toInt()} طول ${((bestE - start) / r * 10).toInt() / 10f}R)"
+            return null
+        }
+        var sx = 0.0
+        var sy = 0.0
+        for (k in 0 until fine) {
+            if (ends[k] >= bestE - 2f) {
+                val a = ca + (k - fine / 2) * fstep
+                sx += cos(a); sy += sin(a)
+            }
+        }
+        var ang = atan2(sy, sx).toFloat()
+        var end = bestE
+        var lcx = cx
+        var lcy = cy
+        val fit = fitAimLine(px, w, h, cx, cy, ang, r, end)
+        if (fit != null) {
+            ang = atan2(fit[1], fit[0])
+            lcx = fit[2]; lcy = fit[3]
+        }
+        val q = when (smooth) { 0 -> 1f; 1 -> 0.75f; 2 -> 0.55f; 3 -> 0.4f; else -> 0.25f }
+        if (hasAng) {
+            val dd = angDiff(ang, pAng)
+            val ad = abs(dd)
+            ang = when {
+                ad < 0.0045f -> pAng                  // اهتزاز أقل من 0.26 درجة: نثبّت
+                ad < 0.03f -> pAng + 0.3f * q * dd
+                ad < 0.12f -> pAng + 0.6f * q * dd
+                else -> ang
+            }
+            if (abs(end - pEnd) < 6f) end = 0.5f * (end + pEnd)
+        }
+        pAng = ang; pEnd = end; hasAng = true
+
+        val ux = cos(ang)
+        val uy = sin(ang)
+        status = ""
+        // مركز الكرة الشبحية من الحلقة (لا من نهاية الخط)
+        var gd = fitGhost(px, w, h, lcx, lcy, ux, uy, r, end + r)
+        if (hasGd && abs(gd - pGd) < 2f) gd = pGd + 0.5f * q * (gd - pGd)
+        pGd = gd; hasGd = true
+        end = gd - r
+        pEnd = end
+        val gx = lcx + ux * gd
+        val gy = lcy + uy * gd
+        var contact: Contact? = null
+        val tick = findTick(px, w, h, r, gx, gy, ux, uy)
+        val tpl = templateContact(px, w, h, tb, r, gx, gy, ux, uy)
+        if (tick != null && (tpl == null || abs(angDiff(atan2(tick[1], tick[0]), atan2(tpl[1], tpl[0]))) < 0.35f)) {
+            contact = Contact(tick[2], tick[3], gx, gy, tick[0], tick[1])
+            status = "ملامسة ✓ (خط اللعبة)"
+        } else if (tpl != null) {
+            contact = Contact(gx + 2f * r * tpl[0], gy + 2f * r * tpl[1], gx, gy, tpl[0], tpl[1])
+            status = "ملامسة ~ (قالب ${(tpl[2] * 100).toInt()})"
+        }
+        if (contact != null) {
+            // تنعيم اتجاه الكرة الهدف (يقلّل اهتزاز نهاية الخط عند الحافة)
+            var oa = atan2(contact.ny, contact.nx)
+            if (hasObjAng) {
+                val dd = angDiff(oa, pObjAng)
+                oa = when {
+                    abs(dd) < 0.006f -> pObjAng
+                    abs(dd) < 0.09f -> pObjAng + 0.3f * q * dd
+                    else -> oa
+                }
+            }
+            pObjAng = oa; hasObjAng = true
+            contact = Contact(contact.ox, contact.oy, contact.gx, contact.gy, cos(oa), sin(oa))
+        } else {
+            hasObjAng = false
+            status = "خط تصويب بلا كرة هدف"
+        }
+        return Detection(lcx, lcy, ang, r, end, TableBox(tb[0], tb[1], tb[2], tb[3]), tw, contact)
+    }
+}
