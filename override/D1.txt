@@ -1,0 +1,450 @@
+package com.aimoverlay
+
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+/** حدود الطاولة الخارجية (حافة الإطار). */
+data class TableBox(val l: Float, val t: Float, val r: Float, val b: Float)
+
+/** ملامسة الكرة البيضاء لكرة أخرى. */
+data class Contact(
+    val ox: Float, val oy: Float,     // مركز الكرة الهدف
+    val gx: Float, val gy: Float,     // مركز الكرة البيضاء لحظة التصادم
+    val nx: Float, val ny: Float      // اتجاه الكرة الهدف بعد الضربة (وحدة)
+)
+
+/**
+ * @param lineEnd مسافة نهاية الخط الأبيض الذي ترسمه اللعبة، من مركز الكرة البيضاء
+ */
+data class Detection(
+    val bx: Float,
+    val by: Float,
+    val angle: Float,
+    val radius: Float,
+    val lineEnd: Float,
+    val table: TableBox,
+    val tableW: Float,
+    val contact: Contact?
+)
+
+/**
+ * كاشف يعمل على بكسلات RGB. يحتفظ بحالة بين الإطارات (الطاولة، موضع الكرة، الزاوية)
+ * فيصبح أسرع وأثبت: الطاولة تُحسب كل فترة، والكرة تُتتبَّع قرب موضعها السابق.
+ */
+class Detector {
+
+    /** مقاطع رسم التطبيق السابقة (x1,y1,x2,y2,...) تُستثنى من كشف الكرة. */
+    @Volatile
+    var exclusions: FloatArray = FloatArray(0)
+
+    /** سبب آخر نتيجة (للتشخيص على الشاشة). */
+    @Volatile
+    var status: String = ""
+
+    /** مستوى بطء الحركة 0..4 (0 = كما كان سابقاً، 4 = أبطأ وأثبت). */
+    @Volatile
+    var smooth: Int = 2
+
+    @Volatile
+    var dbg: String = ""
+
+    private var table: FloatArray? = null
+    private var tableAge = 0
+    private var lastW = 0
+    private var lastH = 0
+
+    private var fr = 0f
+    private var fg = 0f
+    private var fb = 0f
+    private var fsum = 1f
+
+    private var pBx = -1f
+    private var pBy = -1f
+    private var pAng = 0f
+    private var hasAng = false
+    private var pEnd = 0f
+
+    private var pObjAng = 0f
+    private var hasObjAng = false
+    private var pGd = 0f
+    private var hasGd = false
+
+    private var integ = IntArray(0)
+
+    fun reset() {
+        table = null
+        pBx = -1f
+        hasAng = false
+    }
+
+    // ------------------------------------------------------------ ألوان
+
+    /** أبيض أو أبيض مُلوَّن بسماوي خفيف (حين يغطي رسم التطبيق خط اللعبة الأبيض). */
+    private fun isWhite(c: Int): Boolean {
+        val g = (c shr 8) and 255
+        val b = c and 255
+        val r = (c shr 16) and 255
+        return r > 130 && g > 150 && b > 150 && abs(g - b) < 50
+    }
+
+    /** أبيض صارم (خطوط اللعبة النقية): لا يلتقط لمعان الكرات ولا أرقامها البيضاء. */
+    private fun isWhiteStrict(c: Int): Boolean {
+        val g = (c shr 8) and 255
+        val b = c and 255
+        return g > 205 && b > 205 && abs(g - b) < 40
+    }
+
+    /** ألوان رسم التطبيق نفسه (سماوي/ليموني/أرجواني) بعد المزج مع الخلفية. */
+    private fun isOverlayColor(c: Int): Boolean {
+        val r = (c shr 16) and 255
+        val g = (c shr 8) and 255
+        val b = c and 255
+        if (r < 150 && g > 170 && b > 140 && abs(g - b) < 70) return true
+        if (r < 150 && g > 190 && b < 120 && g > r + 80) return true
+        if (r < 150 && g > 150 && b < 100 && g > r + 80) return true   // أخضر ليموني ممزوج بالقماش (حواف الخط)
+        if (r > 150 && b > 150 && g < 110) return true
+        return false
+    }
+
+    /** هل النقطة قرب مقطع رسمه التطبيق نفسه في الإطار السابق؟ (نتجاهلها حتى لا يقرأ الكاشف رسمه كأنه كرة) */
+    private fun nearExcl(x: Float, y: Float): Boolean {
+        val e = exclusions
+        var i = 0
+        while (i + 3 < e.size) {
+            val ax = e[i]; val ay = e[i + 1]
+            val vx = e[i + 2] - ax; val vy = e[i + 3] - ay
+            val l2 = vx * vx + vy * vy
+            var t = if (l2 > 1e-6f) ((x - ax) * vx + (y - ay) * vy) / l2 else 0f
+            if (t < 0f) t = 0f else if (t > 1f) t = 1f
+            val dx = ax + vx * t - x
+            val dy = ay + vy * t - y
+            if (dx * dx + dy * dy < 12f) return true
+            i += 4
+        }
+        return false
+    }
+
+    private fun isFelt(c: Int): Boolean {
+        val r = (c shr 16) and 255
+        val g = (c shr 8) and 255
+        val b = c and 255
+        val s = (r + g + b + 1).toFloat()
+        if (s < 0.22f * fsum || s > 2.2f * fsum) return false
+        val tol = if (s < 0.7f * fsum) 0.11f else 0.07f      // الظلال قرب الحواف أكثر اسوداداً فنتسامح في لونها
+        return abs(r / s - fr / fsum) < tol &&
+                abs(g / s - fg / fsum) < tol &&
+                abs(b / s - fb / fsum) < tol
+    }
+
+
+
+    // ------------------------------------------------------------ الطاولة
+
+    private fun estimateFelt(px: IntArray, w: Int, h: Int): Boolean {
+        val cnt = IntArray(4096)
+        val sr = LongArray(4096)
+        val sg = LongArray(4096)
+        val sb = LongArray(4096)
+        var y = (h * 0.3f).toInt()
+        val y1 = (h * 0.7f).toInt()
+        val x0 = (w * 0.25f).toInt()
+        val x1 = (w * 0.75f).toInt()
+        while (y < y1) {
+            var x = x0
+            while (x < x1) {
+                val c = px[y * w + x]
+                val r = (c shr 16) and 255
+                val g = (c shr 8) and 255
+                val b = c and 255
+                val k = ((r shr 4) shl 8) or ((g shr 4) shl 4) or (b shr 4)
+                cnt[k]++; sr[k] += r.toLong(); sg[k] += g.toLong(); sb[k] += b.toLong()
+                x += 3
+            }
+            y += 3
+        }
+        var bk = 0
+        for (k in 1 until 4096) if (cnt[k] > cnt[bk]) bk = k
+        if (cnt[bk] < 50) return false
+        fr = sr[bk].toFloat() / cnt[bk]
+        fg = sg[bk].toFloat() / cnt[bk]
+        fb = sb[bk].toFloat() / cnt[bk]
+        fsum = fr + fg + fb + 1f
+        return true
+    }
+
+    private inline fun longestRun(n: Int, gap: Int, test: (Int) -> Boolean): IntArray? {
+        var start = -1
+        var last = -1
+        var bestLen = 0
+        var bs = 0
+        var be = 0
+        for (i in 0 until n) {
+            if (test(i)) {
+                if (start < 0) start = i
+                else if (i - last > gap) {
+                    if (last - start > bestLen) { bestLen = last - start; bs = start; be = last }
+                    start = i
+                }
+                last = i
+            }
+        }
+        if (start >= 0 && last - start > bestLen) { bestLen = last - start; bs = start; be = last }
+        return if (bestLen > 0) intArrayOf(bs, be) else null
+    }
+
+    private fun median(v: MutableList<Int>): Float {
+        v.sort()
+        return v[v.size / 2].toFloat()
+    }
+
+    private fun findTable(px: IntArray, w: Int, h: Int): FloatArray? {
+        if (!estimateFelt(px, w, h)) return null
+        val lefts = ArrayList<Int>()
+        val rights = ArrayList<Int>()
+        val gapX = (w * 0.03f).toInt().coerceAtLeast(2)
+        var y = (h * 0.35f).toInt()
+        val yEnd = (h * 0.75f).toInt()
+        while (y < yEnd) {
+            val row = y * w
+            val run = longestRun(w, gapX) { x -> isFelt(px[row + x]) }
+            if (run != null && run[1] - run[0] > w * 0.4f) { lefts.add(run[0]); rights.add(run[1]) }
+            y += 3
+        }
+        if (lefts.size < 8) return null
+        val l = median(lefts)
+        val r = median(rights)
+        val tw = r - l
+        val tops = ArrayList<Int>()
+        val bots = ArrayList<Int>()
+        val gapY = (h * 0.05f).toInt().coerceAtLeast(2)
+        var x = (l + tw * 0.15f).toInt()
+        val xEnd = (l + tw * 0.85f).toInt()
+        while (x < xEnd) {
+            val run = longestRun(h, gapY) { yy -> isFelt(px[yy * w + x]) }
+            if (run != null && run[1] - run[0] > h * 0.4f) { tops.add(run[0]); bots.add(run[1]) }
+            x += 4
+        }
+        if (tops.size < 8) return null
+        // نسبة الطاولة ثابتة تقريباً؛ نصحح الحافة العلوية إن التبست بزخرفة الإطار
+        val expectedH = tw * 0.521f
+        val bot = median(bots)
+        var top = median(tops)
+        if (abs((bot - top) - expectedH) > 0.05f * expectedH) top = bot - expectedH
+        return floatArrayOf(l, top, r, bot)
+    }
+
+    // ------------------------------------------------------------ الكرة البيضاء
+
+    /** تتبّع سريع قرب الموضع السابق. */
+    private fun trackBall(px: IntArray, w: Int, h: Int, x0: Float, y0: Float, r: Float): FloatArray? {
+        var cx = x0
+        var cy = y0
+        var cnt = 0
+        val rr = r * 1.1f
+        repeat(3) {
+            var sx = 0f; var sy = 0f; var n = 0
+            val ya = max(0, (cy - rr).toInt()); val yb = min(h - 1, (cy + rr).toInt())
+            val xa = max(0, (cx - rr).toInt()); val xb = min(w - 1, (cx + rr).toInt())
+            for (yy in ya..yb) for (xx in xa..xb) {
+                val dx = xx - cx; val dy = yy - cy
+                if (dx * dx + dy * dy <= rr * rr && isWhite(px[yy * w + xx])) { sx += xx; sy += yy; n++ }
+            }
+            cnt = n
+            if (n > 0) { cx = sx / n; cy = sy / n }
+        }
+        val area = Math.PI.toFloat() * rr * rr
+        return if (cnt >= 0.35f * area) floatArrayOf(cx, cy) else null
+    }
+
+    /** بحث كامل: أكبر كثافة بيضاء بحجم الكرة داخل الطاولة. */
+    private fun findCueBall(px: IntArray, w: Int, h: Int, box: FloatArray, r: Float): FloatArray? {
+        val k = max(2, (r * 0.9f).toInt())
+        val x0 = max(box[0].toInt() + k + 1, k + 1)
+        val x1 = min(box[2].toInt() - k - 1, w - k - 2)
+        val y0 = max(box[1].toInt() + k + 1, k + 1)
+        val y1 = min(box[3].toInt() - k - 1, h - k - 2)
+        if (x1 <= x0 || y1 <= y0) return null
+
+        val iw = w + 1
+        if (integ.size < iw * (h + 1)) integ = IntArray(iw * (h + 1))
+        for (y in 0 until h) {
+            var rowSum = 0
+            for (x in 0 until w) {
+                if (isWhite(px[y * w + x])) rowSum++
+                integ[(y + 1) * iw + (x + 1)] = integ[y * iw + (x + 1)] + rowSum
+            }
+        }
+        var best = -1
+        var bx = 0
+        var by = 0
+        var y = y0
+        while (y < y1) {
+            var x = x0
+            while (x < x1) {
+                val s = integ[(y + k + 1) * iw + (x + k + 1)] - integ[(y - k) * iw + (x + k + 1)] -
+                        integ[(y + k + 1) * iw + (x - k)] + integ[(y - k) * iw + (x - k)]
+                if (s > best) { best = s; bx = x; by = y }
+                x += 2
+            }
+            y += 2
+        }
+        val side = 2 * k + 1
+        if (best < side * side * 0.4f) return null
+        return trackBall(px, w, h, bx.toFloat(), by.toFloat(), r)
+    }
+
+    // ------------------------------------------------------------ خط التصويب
+
+    /** آخر مسافة فيها بكسل أبيض متصل على الشعاع (مع سماح بفجوة 3 بكسل). */
+    private fun rayEnd(
+        px: IntArray, w: Int, h: Int, cx: Float, cy: Float, a: Float, start: Float, maxD: Float
+    ): Float {
+        val dx = cos(a)
+        val dy = sin(a)
+        var d = start
+        var miss = 0
+        var last = start
+        while (d < maxD) {
+            val xx = cx + dx * d
+            val yy = cy + dy * d
+            var hit = false
+            for (o in -2..2) {
+                val x = (xx - dy * o + 0.5f).toInt()
+                val y = (yy + dx * o + 0.5f).toInt()
+                if (x in 0 until w && y in 0 until h && isWhite(px[y * w + x])) { hit = true; break }
+            }
+            if (hit) { miss = 0; last = d } else { miss++; if (miss > 3) break }
+            d += 1f
+        }
+        return last
+    }
+
+    private fun angDiff(a: Float, b: Float): Float {
+        var d = a - b
+        val tp = (2.0 * Math.PI).toFloat()
+        while (d > Math.PI) d -= tp
+        while (d < -Math.PI) d += tp
+        return d
+    }
+
+    /**
+     * تحسين اتجاه خط التصويب بملاءمة خط مستقيم (PCA) لبكسلاته البيضاء؛ أدق بكثير من اختيار شعاع.
+     * يعيد [cos, sin, نقطة_على_الخط_x, y] أو null.
+     */
+    private fun fitAimLine(
+        px: IntArray, w: Int, h: Int, cx: Float, cy: Float, ang: Float, r: Float, end: Float
+    ): FloatArray? {
+        val d0 = 1.7f * r
+        val d1 = end - 0.6f * r
+        if (d1 - d0 < 2f * r) return null
+        return fitLine(px, w, h, cx, cy, ang, d0, d1, 2.6f, 12, 0.06f, false)
+    }
+
+    /** ملاءمة خط مستقيم (PCA) لبكسلات بيضاء ضمن شريط حول شعاع. يرجع [cos, sin, نقطة x, y] أو null. */
+    private fun fitLine(
+        px: IntArray, w: Int, h: Int, cx: Float, cy: Float, ang: Float,
+        d0: Float, d1: Float, band: Float, minN: Int, maxDev: Float, strict: Boolean
+    ): FloatArray? {
+        val ux = cos(ang); val uy = sin(ang)
+        var n = 0
+        var mx = 0.0; var my = 0.0
+        val xs = ArrayList<Int>(); val ys = ArrayList<Int>()
+        val xa = max(0, (min(cx, cx + ux * d1) - 4f).toInt()); val xb = min(w - 1, (max(cx, cx + ux * d1) + 4f).toInt())
+        val ya = max(0, (min(cy, cy + uy * d1) - 4f).toInt()); val yb = min(h - 1, (max(cy, cy + uy * d1) + 4f).toInt())
+        for (y in ya..yb) for (x in xa..xb) {
+            val vx = x - cx; val vy = y - cy
+            val al = vx * ux + vy * uy
+            if (al < d0 || al > d1) continue
+            if (abs(vx * uy - vy * ux) > band) continue
+            val c = px[y * w + x]
+            if (!(if (strict) isWhiteStrict(c) else isWhite(c))) continue
+            xs.add(x); ys.add(y); mx += x; my += y; n++
+        }
+        if (n < minN) return null
+        mx /= n; my /= n
+        var sxx = 0.0; var syy = 0.0; var sxy = 0.0
+        for (i in 0 until n) {
+            val dx = xs[i] - mx; val dy = ys[i] - my
+            sxx += dx * dx; syy += dy * dy; sxy += dx * dy
+        }
+        var th = (0.5 * atan2(2 * sxy, sxx - syy)).toFloat()
+        if (cos(th) * ux + sin(th) * uy < 0f) th += Math.PI.toFloat()
+        if (abs(angDiff(th, ang)) > maxDev) return null
+        val tx = cos(th); val ty = sin(th)
+        val t = (cx - mx.toFloat()) * tx + (cy - my.toFloat()) * ty
+        return floatArrayOf(tx, ty, mx.toFloat() + tx * t, my.toFloat() + ty * t)
+    }
+
+    // ------------------------------------------------------------ الكرة الهدف
+
+
+
+
+    /**
+     * يلتقط الخط الأبيض القصير الذي ترسمه اللعبة من مركز الكرة الهدف؛ هذا الخط يمرّ بمركز الكرة الهدف
+     * وبمركز الكرة الشبحية، فنجمع البكسلات البيضاء الصارمة حول الشبحية ونبحث عن أكبر عنقود مستقيم
+     * ثم نلاءمه بـ PCA متكرر. أدق بكثير من تقدير مركز الكرة بلونها.
+     * يرجع [nx, ny, ox, oy] أو null.
+     */
+    private fun findTick(
+        px: IntArray, w: Int, h: Int, r: Float, gx: Float, gy: Float, ux: Float, uy: Float
+    ): FloatArray? {
+        dbg = ""
+        val nb = 180
+        val hist = IntArray(nb)
+        val xs = ArrayList<Int>()
+        val ys = ArrayList<Int>()
+        val ya = max(0, (gy - 5f * r).toInt()); val yb = min(h - 1, (gy + 5f * r).toInt())
+        val xa = max(0, (gx - 5f * r).toInt()); val xb = min(w - 1, (gx + 5f * r).toInt())
+        val twoPi = (2.0 * Math.PI).toFloat()
+        for (y in ya..yb) for (x in xa..xb) {
+            val vx = x - gx; val vy = y - gy
+            val d2 = vx * vx + vy * vy
+            if (d2 < 3.42f * r * r || d2 > 25f * r * r) continue
+            if (!isWhiteStrict(px[y * w + x])) continue
+            val d = sqrt(d2)
+            if ((vx * ux + vy * uy) / d < -0.2f) continue          // خلف الشبحية: خط الكرة البيضاء
+            var bi = (((atan2(vy, vx) + Math.PI.toFloat()) / twoPi) * nb).toInt()
+            if (bi >= nb) bi = nb - 1
+            if (bi < 0) bi = 0
+            hist[bi]++
+            xs.add(x); ys.add(y)
+        }
+        val total = xs.size
+        if (total < 12) return null
+        val sm = IntArray(nb) { hist[it] + hist[(it + 1) % nb] + hist[(it + nb - 1) % nb] }
+        val used = ArrayList<Int>()
+        var bestN = 0
+        var res: FloatArray? = null
+        val band = BooleanArray(total)
+        for (cand in 0 until 4) {
+            var bi = -1
+            var bv = 7
+            for (i in 0 until nb) {
+                if (sm[i] <= bv) continue
+                var near = false
+                for (u in used) { val dd = abs(i - u); if (min(dd, nb - dd) <= 3) { near = true; break } }
+                if (near) continue
+                bv = sm[i]; bi = i
+            }
+            if (bi < 0) break
+            used.add(bi)
+            val phi = -Math.PI.toFloat() + (bi + 0.5f) * twoPi / nb
+            // بين حلقة الشبحية ومركز الهدف لا يوجد أبيض في خط الهدف، بخلاف خط انحراف الكرة البيضاء
+            var c = 0
+            var tot = 0
+            var t = 1.3f * r
+            while (t <= 1.9f * r) {
+                val xx = (gx + cos(phi) * t + 0.5f).toInt()
+                val yy = (gy + sin(phi) * t + 0.5f).toInt()
+                tot++
+                if (xx in 0 until w && yy in 0 until h && isWhiteStrict(px[yy * w + xx])) c++
+                t += 1f
+            }
+            if (tot > 0 && c.toFloat() / tot >= 0.4f) continue
+
