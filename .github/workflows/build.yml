@@ -8,7 +8,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Unzip project
-        run: unzip -q -o "*.zip"
+        run: |
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::No zip in repo root. Files here: $(ls | tr '\n' ' ')"
+            exit 1
+          fi
+          z="${zips[${#zips[@]}-1]}"
+          echo "Using $z"
+          unzip -q -o "$z"
+          if [ ! -d AimOverlay ]; then
+            echo "::error::AimOverlay folder missing after unzip. Files: $(ls | tr '\n' ' ')"
+            exit 1
+          fi
       - name: Apply override
         run: |
           if [ -f override/Detector.kt ]; then
