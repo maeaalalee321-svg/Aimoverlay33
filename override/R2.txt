@@ -1,0 +1,334 @@
+    private fun startAsForeground() {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL, "خط التصويب", NotificationManager.IMPORTANCE_LOW)
+        )
+        val stop = PendingIntent.getService(
+            this, 0,
+            Intent(this, OverlayService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val n = Notification.Builder(this, CHANNEL)
+            .setContentTitle("خط التصويب يعمل")
+            .setContentText("اضغط إيقاف لإغلاقه")
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .addAction(Notification.Action.Builder(android.R.drawable.ic_delete, "إيقاف", stop).build())
+            .setOngoing(true)
+            .build()
+        if (Build.VERSION.SDK_INT >= 29)
+            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        else
+            startForeground(1, n)
+    }
+
+    private fun addOverlay() {
+        val v = AimOverlayView(this)
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        )
+        if (Build.VERSION.SDK_INT >= 28)
+            lp.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        wm.addView(v, lp)
+        overlay = v
+    }
+
+    /** زر عائم قابل للسحب: ضغطة قصيرة = تشغيل/إيقاف الخط، ضغطة مطوّلة = إغلاق التطبيق. */
+    private fun addBubble() {
+        val size = (52 * resources.displayMetrics.density).toInt()
+        val tv = TextView(this).apply {
+            gravity = Gravity.CENTER
+            textSize = 12f
+            setTextColor(Color.WHITE)
+        }
+        fun paint() {
+            tv.text = if (enabled) "ON" else "OFF"
+            tv.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(if (enabled) Color.argb(230, 20, 140, 60) else Color.argb(230, 170, 30, 30))
+                setStroke(3, Color.argb(230, 40, 40, 40))
+            }
+        }
+        paint()
+        val lp = WindowManager.LayoutParams(
+            size, size,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        )
+        lp.gravity = Gravity.TOP or Gravity.START
+        lp.x = 0
+        lp.y = (120 * resources.displayMetrics.density).toInt()
+
+        var downX = 0f; var downY = 0f; var startX = 0; var startY = 0
+        var moved = false; var downTime = 0L
+        tv.setOnTouchListener { _, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = e.rawX; downY = e.rawY; startX = lp.x; startY = lp.y
+                    moved = false; downTime = System.currentTimeMillis()
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (e.rawX - downX).toInt(); val dy = (e.rawY - downY).toInt()
+                    if (Math.abs(dx) > 12 || Math.abs(dy) > 12) moved = true
+                    if (moved) {
+                        lp.x = startX + dx; lp.y = startY + dy
+                        wm.updateViewLayout(tv, lp)
+                    }
+                }
+                MotionEvent.ACTION_UP -> if (!moved) {
+                    if (System.currentTimeMillis() - downTime > 800) {
+                        Toast.makeText(this, "تم الإيقاف", Toast.LENGTH_SHORT).show()
+                        stopSelf()
+                    } else {
+                        enabled = !enabled
+                        if (!enabled) overlay?.clear()
+                        paint()
+                    }
+                }
+            }
+            true
+        }
+        wm.addView(tv, lp)
+        bubble = tv
+    }
+
+    @Suppress("DEPRECATION")
+    private fun realSize(): IntArray {
+        val m = DisplayMetrics()
+        wm.defaultDisplay.getRealMetrics(m)
+        return intArrayOf(m.widthPixels, m.heightPixels, m.densityDpi)
+    }
+
+    private fun setupCapture() {
+        val s = realSize()
+        capW = s[0] / SCALE
+        capH = s[1] / SCALE
+        px = IntArray(capW * capH)
+
+        reader?.close()
+        val r = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2)
+        reader = r
+        r.setOnImageAvailableListener({ ir -> onFrame(ir) }, bg)
+
+        val d = display
+        if (d == null) {
+            display = projection!!.createVirtualDisplay(
+                "aim", capW, capH, s[2],
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                r.surface, null, null
+            )
+        } else {
+            d.resize(capW, capH, s[2])
+            d.surface = r.surface
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (projection != null) main.post { setupCapture() }   // تدوير الشاشة
+    }
+
+    private fun onFrame(ir: ImageReader) {
+        val img = try { ir.acquireLatestImage() } catch (e: Exception) { null } ?: return
+        try {
+          try {
+            val now = System.currentTimeMillis()
+            if (now - lastRun < MIN_INTERVAL_MS) return
+            lastRun = now
+
+            val w = img.width
+            val h = img.height
+            if (w != capW || h != capH) return
+            val plane = img.planes[0]
+            val ib = plane.buffer.order(java.nio.ByteOrder.LITTLE_ENDIAN).asIntBuffer()
+            val rowInts = plane.rowStride / 4
+            for (y in 0 until h) {
+                ib.position(y * rowInts)
+                ib.get(px, y * w, w)
+            }
+            // RGBA (little-endian int = A B G R) -> 0x00RRGGBB
+            for (i in 0 until w * h) {
+                val c = px[i]
+                px[i] = ((c and 255) shl 16) or (c and 0xFF00) or ((c shr 16) and 255)
+            }
+
+            val prefs = getSharedPreferences("aim", MODE_PRIVATE)
+            val bounces = prefs.getInt("bounces", 3)
+            val adjust = prefs.getInt("adjust2", 0)          // بوحدة 0.1% من عرض الطاولة
+            val showCue = prefs.getBoolean("showCue", false)
+            val showObject = true
+
+            if (!enabled) return
+            detector.smooth = prefs.getInt("smooth", 2)
+            val det = detector.detect(px, w, h)
+            val diag = prefs.getBoolean("diag", true)
+            val st = detector.status
+            main.post { overlay?.setStatus(st, diag) }
+            if (det == null) {
+                // لا نمسح فوراً: نُبقي آخر رسم لحظات قصيرة حتى لا يرفرف الخط
+                if (now - lastGood > 450L) {
+                    detector.exclusions = FloatArray(0)
+                    main.post { overlay?.clear() }
+                }
+                return
+            }
+            lastGood = now
+            val inset = adjust * 0.001f * det.tableW
+            val path = Trajectory.compute(det, inset, bounces, showObject)
+            val ex = ArrayList<Float>()
+            fun addLine(l: List<FloatArray>?) {
+                if (l == null) return
+                for (i in 0 until l.size - 1) { ex.add(l[i][0]); ex.add(l[i][1]); ex.add(l[i + 1][0]); ex.add(l[i + 1][1]) }
+            }
+            addLine(path.obj)
+            if (showCue) { addLine(path.cue); addLine(path.deflect) }
+            detector.exclusions = ex.toFloatArray()
+            main.post { if (enabled) overlay?.update(path, w, h, showCue) }
+          } catch (e: Exception) {
+            // إطار تالف أو تغيّر الحجم أثناء المعالجة: نتجاهله
+          }
+        } finally {
+            img.close()
+        }
+    }
+
+    override fun onDestroy() {
+        reader?.setOnImageAvailableListener(null, null)
+        display?.release()
+        reader?.close()
+        projection?.stop()
+        overlay?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        bubble?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        if (::thread.isInitialized) thread.quitSafely()
+        super.onDestroy()
+    }
+}
+
+// ===== MainActivity.kt =====
+class MainActivity : ComponentActivity() {
+
+    private val prefs by lazy { getSharedPreferences("aim", Context.MODE_PRIVATE) }
+
+    private val capture = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+        if (res.resultCode == Activity.RESULT_OK && res.data != null) {
+            val i = Intent(this, OverlayService::class.java)
+                .putExtra(OverlayService.EXTRA_CODE, res.resultCode)
+                .putExtra(OverlayService.EXTRA_DATA, res.data)
+            startForegroundService(i)
+            Toast.makeText(this, "تم التشغيل — افتح اللعبة", Toast.LENGTH_LONG).show()
+            moveTaskToBack(true)
+        } else {
+            Toast.makeText(this, "لم يتم السماح بتسجيل الشاشة", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private val notifPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.decorView.layoutDirection = View.LAYOUT_DIRECTION_RTL
+
+        val pad = (20 * resources.displayMetrics.density).toInt()
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+        }
+
+        fun label(t: String, size: Float = 16f) = TextView(this).apply {
+            text = t; textSize = size; gravity = Gravity.START
+            setPadding(0, pad / 2, 0, 0)
+        }
+
+        root.addView(label("خط التصويب والارتداد", 24f))
+        root.addView(label("شغّل التطبيق ثم افتح اللعبة. سيظهر خط المسار فوق الطاولة ويتحرك مع العصا."))
+
+        // عدد الارتدادات
+        val bTxt = label("")
+        val bSeek = SeekBar(this).apply { max = 5 }
+        fun showB(v: Int) { bTxt.text = "عدد الارتدادات: $v" }
+        bSeek.progress = prefs.getInt("bounces", 3) - 1
+        showB(bSeek.progress + 1)
+        bSeek.setOnSeekBarChangeListener(listener { p ->
+            prefs.edit().putInt("bounces", p + 1).apply(); showB(p + 1)
+        })
+        root.addView(bTxt); root.addView(bSeek)
+
+        // ضبط حدود الطاولة
+        val aTxt = label("")
+        val aSeek = SeekBar(this).apply { max = 60 }
+        fun showA(v: Int) { aTxt.text = "ضبط حدود الطاولة: ${v - 30}  (إن كان الارتداد يسبق الحافة أو يتأخر عنها)" }
+        aSeek.progress = prefs.getInt("adjust2", 0) + 30
+        showA(aSeek.progress)
+        aSeek.setOnSeekBarChangeListener(listener { p ->
+            prefs.edit().putInt("adjust2", p - 30).apply(); showA(p)
+        })
+        root.addView(aTxt); root.addView(aSeek)
+
+        // بطء الحركة (التنعيم)
+        val sTxt = label("")
+        val sSeek = SeekBar(this).apply { max = 4 }
+        fun showS(v: Int) { sTxt.text = "بطء حركة الخط: $v  (0 = سريع، 4 = بطيء جداً وثابت)" }
+        sSeek.progress = prefs.getInt("smooth", 2)
+        showS(sSeek.progress)
+        sSeek.setOnSeekBarChangeListener(listener { p ->
+            prefs.edit().putInt("smooth", p).apply(); showS(p)
+        })
+        root.addView(sTxt); root.addView(sSeek)
+
+        val cb = CheckBox(this).apply {
+            text = "إظهار خط الكرة البيضاء (السماوي) أيضاً"
+            isChecked = prefs.getBoolean("showCue", false)
+            setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("showCue", c).apply() }
+        }
+        root.addView(cb)
+
+        val dg = CheckBox(this).apply {
+            text = "إظهار حالة التشخيص أعلى الشاشة (للمساعدة في إصلاح الأخطاء)"
+            isChecked = prefs.getBoolean("diag", true)
+            setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("diag", c).apply() }
+        }
+        root.addView(dg)
+
+        val start = Button(this).apply {
+            text = "تشغيل"
+            setOnClickListener { startFlow() }
+        }
+        val stop = Button(this).apply {
+            text = "إيقاف"
+            setOnClickListener {
+                startService(Intent(this@MainActivity, OverlayService::class.java)
+                    .setAction(OverlayService.ACTION_STOP))
+            }
+        }
+        root.addView(start); root.addView(stop)
+        setContentView(root)
+    }
+
+    private fun listener(f: (Int) -> Unit) = object : SeekBar.OnSeekBarChangeListener {
+        override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) { if (fromUser) f(p) }
+        override fun onStartTrackingTouch(s: SeekBar?) {}
+        override fun onStopTrackingTouch(s: SeekBar?) {}
+    }
+
+    private fun startFlow() {
+        if (!Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, "فعّل «العرض فوق التطبيقات الأخرى» ثم ارجع واضغط تشغيل", Toast.LENGTH_LONG).show()
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
+
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        capture.launch(mpm.createScreenCaptureIntent())
+    }
+}
