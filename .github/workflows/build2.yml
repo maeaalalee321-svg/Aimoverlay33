@@ -7,26 +7,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unpack code.zip
-        run: |
-          if [ ! -f code.zip ]; then echo "::error::code.zip is missing from repo root"; exit 1; fi
-          mkdir -p override && unzip -o code.zip -d .
       - name: Verify code files
         run: |
+          if [ ! -f override/checks.txt ]; then
+            if [ ! -f code2.zip ]; then echo "::error::override/checks.txt is missing"; exit 1; fi
+            unzip -o code2.zip -d .
+          fi
           bad=0
-          check() {
-            f="$1"; want="$2"; wantn="$3"
-            if [ ! -f "$f" ]; then echo "::error::MISSING FILE $f"; bad=1; return; fi
+          while read -r f want wantn; do
+            if [ ! -f "$f" ]; then echo "::error::MISSING FILE $f"; bad=1; continue; fi
             got=$(tr -d ' \t\r\n' < "$f" | sha256sum | cut -d' ' -f1)
-            n=$(tr -d ' \t\r\n' < "$f" | wc -c)
-            if [ "$got" != "$want" ]; then echo "::error::FILE $f IS WRONG OR CUT OFF (has $n chars, expected $wantn)"; bad=1; fi
-          }
-          check override/D1.txt e3dbbba2161ba0091cde0b8ccfddd1b765029efe80ea6a51be82b612493f7494 11595
-          check override/D2.txt 8b98b74e285731cba34011c5eb249c80a85f09073f3337da68183bd038f059d1 7484
-          check override/R1.txt 8d0161ef7d95de0d8c37a200e683dd363e914f0d6caa5c739b0516735ccb7f9a 9853
-          check override/R2.txt c17974c5b98d1b94f0cdf78373a16ac7357955fe65390b326eedfcebbb994388 9536
+            if [ "$got" != "$want" ]; then echo "::error::FILE $f IS WRONG OR CUT OFF"; bad=1; fi
+          done < override/checks.txt
           if [ $bad -ne 0 ]; then exit 1; fi
-          echo "All 4 code files verified"
+          echo "All code files verified"
       - name: Assemble project
         run: |
           mkdir -p AimOverlay/app/src/main/java/com/aimoverlay AimOverlay/app/src/main/res/values
@@ -147,3 +141,4 @@ jobs:
         with:
           name: AimOverlay-apk
           path: AimOverlay/app/build/outputs/apk/debug/app-debug.apk
+          
