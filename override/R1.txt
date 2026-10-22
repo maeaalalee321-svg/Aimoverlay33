@@ -64,7 +64,8 @@ class Plan(
     val deflect: List<FloatArray>?,
     val obj: List<FloatArray>?,
     val potted: Boolean,
-    val radius: Float
+    val radius: Float,
+    val free: Boolean = false
 )
 
 object Trajectory {
@@ -117,7 +118,7 @@ object Trajectory {
             return Plan(cue, floatArrayOf(gx, gy), deflect, path, potted, r)
         }
         val pts = bouncePath(d.bx, d.by, ux, uy, box, maxBounces, d.tableW * 6f)
-        return Plan(pts, pts.last(), null, null, false, r)
+        return Plan(pts, pts.last(), null, null, false, r, true)
     }
 
     private fun bouncePath(
@@ -192,6 +193,8 @@ object Trajectory {
             }
             val tWall = maxOf(0f, minOf(tx, ty))
 
+            val ex = x + nx * tWall
+            val ey = y + ny * tWall
             var bestT = Float.MAX_VALUE
             var bx = 0f
             var by = 0f
@@ -200,7 +203,12 @@ object Trajectory {
                 val vy = p[1] - y
                 val along = vx * nx + vy * ny
                 val perp = abs(vx * ny - vy * nx)
-                if (along > 0f && perp < p[2] && along < bestT) { bestT = along; bx = p[0]; by = p[1] }
+                if (along <= 0f || perp >= p[2] || along >= bestT) continue
+                // المركز يرتد عن حافة مُزاحة؛ فالجيب قريب من نقطة الارتداد وليس على الشعاع نفسه
+                val dwx = ex - p[0]
+                val dwy = ey - p[1]
+                val lim = if (p[2] > 2f * r) 5f * r else 3.6f * r
+                if (along <= tWall || dwx * dwx + dwy * dwy < lim * lim) { bestT = along; bx = p[0]; by = p[1] }
             }
 
             if (first) {
@@ -209,12 +217,10 @@ object Trajectory {
                 pts.add(floatArrayOf(x + nx * off, y + ny * off))
                 first = false
             }
-            if (bestT < tWall + 3f * r) {
+            if (bestT < Float.MAX_VALUE) {
                 pts.add(floatArrayOf(bx, by))
                 return Pair(pts, true)
             }
-            val ex = x + nx * tWall
-            val ey = y + ny * tWall
             pts.add(floatArrayOf(ex, ey))
             if (bounces >= maxBounces) break
             if (tx <= ty) nx = -nx else ny = -ny
@@ -298,7 +304,7 @@ class AimOverlayView(context: Context) : View(context) {
         val p = plan ?: return
         val rad = p.radius * sx
 
-        if (showCue) {
+        if (showCue || p.free) {
             if (p.cue.size >= 2) {
                 val g = path(p.cue)
                 canvas.drawPath(g, cueLine)
@@ -380,11 +386,4 @@ class OverlayService : Service() {
                 }
             }, main)
         }
-
-        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        addOverlay()
-        addBubble()
-        setupCapture()
-        return START_NOT_STICKY
-    }
 
