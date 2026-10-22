@@ -1,3 +1,71 @@
+    // ------------------------------------------------------------ الكرة الهدف
+
+
+
+
+    /**
+     * يلتقط الخط الأبيض القصير الذي ترسمه اللعبة من مركز الكرة الهدف؛ هذا الخط يمرّ بمركز الكرة الهدف
+     * وبمركز الكرة الشبحية، فنجمع البكسلات البيضاء الصارمة حول الشبحية ونبحث عن أكبر عنقود مستقيم
+     * ثم نلاءمه بـ PCA متكرر. أدق بكثير من تقدير مركز الكرة بلونها.
+     * يرجع [nx, ny, ox, oy] أو null.
+     */
+    private fun findTick(
+        px: IntArray, w: Int, h: Int, r: Float, gx: Float, gy: Float, ux: Float, uy: Float
+    ): FloatArray? {
+        dbg = ""
+        val nb = 180
+        val hist = IntArray(nb)
+        val xs = ArrayList<Int>()
+        val ys = ArrayList<Int>()
+        val ya = max(0, (gy - 5f * r).toInt()); val yb = min(h - 1, (gy + 5f * r).toInt())
+        val xa = max(0, (gx - 5f * r).toInt()); val xb = min(w - 1, (gx + 5f * r).toInt())
+        val twoPi = (2.0 * Math.PI).toFloat()
+        for (y in ya..yb) for (x in xa..xb) {
+            val vx = x - gx; val vy = y - gy
+            val d2 = vx * vx + vy * vy
+            if (d2 < 3.42f * r * r || d2 > 25f * r * r) continue
+            if (!isWhiteStrict(px[y * w + x])) continue
+            val d = sqrt(d2)
+            if ((vx * ux + vy * uy) / d < -0.2f) continue          // خلف الشبحية: خط الكرة البيضاء
+            var bi = (((atan2(vy, vx) + Math.PI.toFloat()) / twoPi) * nb).toInt()
+            if (bi >= nb) bi = nb - 1
+            if (bi < 0) bi = 0
+            hist[bi]++
+            xs.add(x); ys.add(y)
+        }
+        val total = xs.size
+        if (total < 12) return null
+        val sm = IntArray(nb) { hist[it] + hist[(it + 1) % nb] + hist[(it + nb - 1) % nb] }
+        val used = ArrayList<Int>()
+        var bestN = 0
+        var res: FloatArray? = null
+        val band = BooleanArray(total)
+        for (cand in 0 until 4) {
+            var bi = -1
+            var bv = 7
+            for (i in 0 until nb) {
+                if (sm[i] <= bv) continue
+                var near = false
+                for (u in used) { val dd = abs(i - u); if (min(dd, nb - dd) <= 3) { near = true; break } }
+                if (near) continue
+                bv = sm[i]; bi = i
+            }
+            if (bi < 0) break
+            used.add(bi)
+            val phi = -Math.PI.toFloat() + (bi + 0.5f) * twoPi / nb
+            // بين حلقة الشبحية ومركز الهدف لا يوجد أبيض في خط الهدف، بخلاف خط انحراف الكرة البيضاء
+            var c = 0
+            var tot = 0
+            var t = 1.3f * r
+            while (t <= 1.9f * r) {
+                val xx = (gx + cos(phi) * t + 0.5f).toInt()
+                val yy = (gy + sin(phi) * t + 0.5f).toInt()
+                tot++
+                if (xx in 0 until w && yy in 0 until h && isWhiteStrict(px[yy * w + xx])) c++
+                t += 1f
+            }
+            if (tot > 0 && c.toFloat() / tot >= 0.4f) continue
+
             var cur = phi
             var mx = gx
             var my = gy
@@ -145,139 +213,86 @@
     }
 
 
-    // ------------------------------------------------------------ الواجهة
 
-    fun detect(px: IntArray, w: Int, h: Int): Detection? {
-        if (w != lastW || h != lastH) { reset(); lastW = w; lastH = h }
+    // ------------------------------------------------------------ الحلقة وخط الكرة الهدف (v12)
 
-        tableAge++
-        if (table == null || tableAge > 40) {
-            val t = findTable(px, w, h)
-            if (t != null) {
-                val old = table
-                val same = old != null && abs(old[0] - t[0]) < 3f && abs(old[1] - t[1]) < 3f &&
-                        abs(old[2] - t[2]) < 3f && abs(old[3] - t[3]) < 3f
-                if (!same) table = t
-                tableAge = 0
-            } else if (table == null) { status = "لا طاولة"; return null } else tableAge = 30
-        }
-        val tb = table ?: return null
-        val tw = tb[2] - tb[0]
-        if (tw < w * 0.4f) { table = null; status = "لا طاولة"; return null }
-        val r = tw * 0.0136f
-
-        var ball = if (pBx >= 0f) trackBall(px, w, h, pBx, pBy, r) else null
-        if (ball == null) ball = findCueBall(px, w, h, tb, r)
-        if (ball == null) { pBx = -1f; hasAng = false; status = "لا كرة بيضاء"; return null }
-        val cx = ball[0]
-        val cy = ball[1]
-        pBx = cx; pBy = cy
-
-        // بحث خشن كل 2 درجة بطول محدود، ثم دقيق حول الأفضل
-        val start = r * 1.5f
-        val coarseMax = min(tw * 0.2f, 170f)
-        val step = (2.0 * Math.PI / 180.0).toFloat()
-        var ca = 0f
-        var bestC = -1f
-        for (i in 0 until 180) {
-            val a = i * step
-            val e = rayEnd(px, w, h, cx, cy, a, start, coarseMax)
-            if (e > bestC) { bestC = e; ca = a }
-        }
-        if (bestC - start < r * 1.5f) {
-            hasAng = false; hasGd = false; pBx = -1f
-            status = "لا خط تصويب (كرة ${cx.toInt()},${cy.toInt()} طول ${((bestC - start) / r * 10).toInt() / 10f}R)"
-            return null
-        }
-        if (hasAng) {
-            val ep = rayEnd(px, w, h, cx, cy, pAng, start, coarseMax)
-            if (ep - start >= 0.85f * (bestC - start)) ca = pAng
-        }
-
-        val maxD = tw * 0.9f
-        val fine = 17
-        val ends = FloatArray(fine)
-        val fstep = (0.25 * Math.PI / 180.0).toFloat()
-        var bestE = -1f
-        for (k in 0 until fine) {
-            val a = ca + (k - fine / 2) * fstep
-            ends[k] = rayEnd(px, w, h, cx, cy, a, start, maxD)
-            if (ends[k] > bestE) bestE = ends[k]
-        }
-        if (bestE - start < r * 2f) {
-            hasAng = false; hasGd = false; pBx = -1f
-            status = "خط قصير (كرة ${cx.toInt()},${cy.toInt()} طول ${((bestE - start) / r * 10).toInt() / 10f}R)"
-            return null
-        }
-        var sx = 0.0
-        var sy = 0.0
-        for (k in 0 until fine) {
-            if (ends[k] >= bestE - 2f) {
-                val a = ca + (k - fine / 2) * fstep
-                sx += cos(a); sy += sin(a)
-            }
-        }
-        var ang = atan2(sy, sx).toFloat()
-        var end = bestE
-        var lcx = cx
-        var lcy = cy
-        val fit = fitAimLine(px, w, h, cx, cy, ang, r, end)
-        if (fit != null) {
-            ang = atan2(fit[1], fit[0])
-            lcx = fit[2]; lcy = fit[3]
-        }
-        val q = when (smooth) { 0 -> 1f; 1 -> 0.75f; 2 -> 0.55f; 3 -> 0.4f; else -> 0.25f }
-        if (hasAng) {
-            val dd = angDiff(ang, pAng)
-            val ad = abs(dd)
-            ang = when {
-                ad < 0.0045f -> pAng                  // اهتزاز أقل من 0.26 درجة: نثبّت
-                ad < 0.03f -> pAng + 0.3f * q * dd
-                ad < 0.12f -> pAng + 0.6f * q * dd
-                else -> ang
-            }
-            if (abs(end - pEnd) < 6f) end = 0.5f * (end + pEnd)
-        }
-        pAng = ang; pEnd = end; hasAng = true
-
-        val ux = cos(ang)
-        val uy = sin(ang)
-        status = ""
-        // مركز الكرة الشبحية من الحلقة (لا من نهاية الخط)
-        var gd = fitGhost(px, w, h, lcx, lcy, ux, uy, r, end + r)
-        if (hasGd && abs(gd - pGd) < 2f) gd = pGd + 0.5f * q * (gd - pGd)
-        pGd = gd; hasGd = true
-        end = gd - r
-        pEnd = end
-        val gx = lcx + ux * gd
-        val gy = lcy + uy * gd
-        var contact: Contact? = null
-        val tick = findTick(px, w, h, r, gx, gy, ux, uy)
-        val tpl = templateContact(px, w, h, tb, r, gx, gy, ux, uy)
-        if (tick != null && (tpl == null || abs(angDiff(atan2(tick[1], tick[0]), atan2(tpl[1], tpl[0]))) < 0.35f)) {
-            contact = Contact(tick[2], tick[3], gx, gy, tick[0], tick[1])
-            status = "ملامسة ✓ (خط اللعبة)"
-        } else if (tpl != null) {
-            contact = Contact(gx + 2f * r * tpl[0], gy + 2f * r * tpl[1], gx, gy, tpl[0], tpl[1])
-            status = "ملامسة ~ (قالب ${(tpl[2] * 100).toInt()})"
-        }
-        if (contact != null) {
-            // تنعيم اتجاه الكرة الهدف (يقلّل اهتزاز نهاية الخط عند الحافة)
-            var oa = atan2(contact.ny, contact.nx)
-            if (hasObjAng) {
-                val dd = angDiff(oa, pObjAng)
-                oa = when {
-                    abs(dd) < 0.006f -> pObjAng
-                    abs(dd) < 0.09f -> pObjAng + 0.3f * q * dd
-                    else -> oa
-                }
-            }
-            pObjAng = oa; hasObjAng = true
-            contact = Contact(contact.ox, contact.oy, contact.gx, contact.gy, cos(oa), sin(oa))
-        } else {
-            hasObjAng = false
-            status = "خط تصويب بلا كرة هدف"
-        }
-        return Detection(lcx, lcy, ang, r, end, TableBox(tb[0], tb[1], tb[2], tb[3]), tw, contact)
+    /** هل نقطة الحلقة تقع داخل الكرة البيضاء (تُهمل لأنها بيضاء أصلاً)؟ */
+    private fun inCue(x: Float, y: Float, cx: Float, cy: Float, r: Float): Boolean {
+        val dx = x - cx; val dy = y - cy
+        return dx * dx + dy * dy < 1.1f * r * 1.1f * r
     }
-}
+
+    /** نقاط حلقة نصف قطرها rad حول (gx,gy): تعيد [عدد_صالح, عدد_أبيض] مع تسامح بكسل. */
+    private fun ringCount(
+        px: IntArray, w: Int, h: Int, gx: Float, gy: Float, rad: Float, ns: Int, cx: Float, cy: Float, r: Float
+    ): IntArray {
+        var valid = 0
+        var white = 0
+        for (j in 0 until ns) {
+            val a = j * 2f * Math.PI.toFloat() / ns
+            val sx = gx + cos(a) * rad
+            val sy = gy + sin(a) * rad
+            if (inCue(sx, sy, cx, cy, r)) continue
+            val xx = (sx + 0.5f).toInt(); val yy = (sy + 0.5f).toInt()
+            if (xx < 1 || yy < 1 || xx >= w - 1 || yy >= h - 1) continue
+            valid++
+            var hit = false
+            for (oy in -1..1) {
+                for (ox in -1..1) if (isWhiteStrict(px[(yy + oy) * w + xx + ox])) { hit = true; break }
+                if (hit) break
+            }
+            if (hit) white++
+        }
+        return intArrayOf(valid, white)
+    }
+
+    /** الحلقة ليست قرصاً أبيض ممتلئاً: داخلها (نصف القطر 0.5) يجب أن يكون في معظمه ليس أبيض. */
+    private fun ringHollow(px: IntArray, w: Int, h: Int, gx: Float, gy: Float, cx: Float, cy: Float, r: Float): Boolean {
+        var v = 0
+        var wh = 0
+        for (j in 0 until 16) {
+            val a = j * 2f * Math.PI.toFloat() / 16
+            val sx = gx + cos(a) * 0.5f * r
+            val sy = gy + sin(a) * 0.5f * r
+            if (inCue(sx, sy, cx, cy, r)) continue
+            val xx = (sx + 0.5f).toInt(); val yy = (sy + 0.5f).toInt()
+            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue
+            v++
+            if (isWhiteStrict(px[yy * w + xx])) wh++
+        }
+        return v < 5 || wh <= 0.45f * v
+    }
+
+    /**
+     * بحث ثنائي الأبعاد عن حلقة الكرة الشبحية قرب الكرة البيضاء (الضربات القريبة حيث لا يظهر خط التصويب).
+     * يرجع [x, y] مركز الحلقة أو null.
+     */
+    private fun findRingNear(px: IntArray, w: Int, h: Int, cx: Float, cy: Float, r: Float): FloatArray? {
+        val lim = 6f * r
+        val ns = 48
+        var best = -1000
+        val cxs = ArrayList<Float>(); val cys = ArrayList<Float>(); val scs = ArrayList<Int>()
+        val x0 = max(2, (cx - lim).toInt()); val x1 = min(w - 3, (cx + lim).toInt())
+        val y0 = max(2, (cy - lim).toInt()); val y1 = min(h - 3, (cy + lim).toInt())
+        for (y in y0..y1) for (x in x0..x1) {
+            val dx = x - cx; val dy = y - cy
+            val d2 = dx * dx + dy * dy
+            if (d2 > lim * lim || d2 < 0.3f * r * 0.3f * r) continue
+            val gx = x.toFloat(); val gy = y.toFloat()
+            // اختبار سريع: مركز الحلقة ليس أبيض (إلا خطوط التصويب) — نتخطى فقط إن كان قرصاً أبيض ممتلئاً
+            val qc = ringCount(px, w, h, gx, gy, r, 8, cx, cy, r)
+            if (qc[0] < 3 || qc[1] < 0.5f * qc[0]) continue
+            val rc = ringCount(px, w, h, gx, gy, r, ns, cx, cy, r)
+            if (rc[0] < 22) continue
+            if (rc[1] < 0.68f * rc[0]) continue
+            if (!ringHollow(px, w, h, gx, gy, cx, cy, r)) continue
+            val sc = rc[1] * 2 - rc[0]
+            if (sc > best) best = sc
+            cxs.add(gx); cys.add(gy); scs.add(sc)
+        }
+        if (best < 0) return null
+        var sx = 0.0; var sy = 0.0; var n = 0
+        for (i in scs.indices) if (scs[i] >= best - 3) { sx += cxs[i]; sy += cys[i]; n++ }
+        return floatArrayOf((sx / n).toFloat(), (sy / n).toFloat())
+    }
+
