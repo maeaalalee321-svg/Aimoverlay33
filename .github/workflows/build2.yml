@@ -9,12 +9,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify code files
         run: |
-          if [ ! -f override/checks.txt ]; then
-            if [ ! -f code2.zip ]; then echo "::error::override/checks.txt is missing"; exit 1; fi
-            unzip -o code2.zip -d .
-          fi
+          ver() { grep -m1 '^# v' "$1" 2>/dev/null | tr -dc '0-9'; }
+          zv=0; ov=0
+          if [ -f code2.zip ]; then unzip -p code2.zip override/checks.txt > /tmp/zc.txt 2>/dev/null; zv=$(ver /tmp/zc.txt); fi
+          if [ -f override/checks.txt ]; then ov=$(ver override/checks.txt); fi
+          zv=${zv:-0}; ov=${ov:-0}
+          echo "zip version=$zv folder version=$ov"
+          if [ "$zv" -gt "$ov" ]; then mkdir -p override && unzip -o code2.zip -d .; fi
+          if [ ! -f override/checks.txt ]; then echo "::error::no code files found (upload code2.zip or create override/ files)"; exit 1; fi
           bad=0
           while read -r f want wantn; do
+            case "$f" in "#"*|"") continue;; esac
             if [ ! -f "$f" ]; then echo "::error::MISSING FILE $f"; bad=1; continue; fi
             got=$(tr -d ' \t\r\n' < "$f" | sha256sum | cut -d' ' -f1)
             if [ "$got" != "$want" ]; then echo "::error::FILE $f IS WRONG OR CUT OFF"; bad=1; fi
@@ -117,7 +122,7 @@ jobs:
               <string name="app_name">خط التصويب</string>
           </resources>
           EOF
-          { cat ../override/D1.txt; echo; cat ../override/D2.txt; echo; } > app/src/main/java/com/aimoverlay/Detector.kt
+          { cat ../override/D1.txt; echo; cat ../override/D2.txt; echo; cat ../override/D3.txt; echo; } > app/src/main/java/com/aimoverlay/Detector.kt
           { cat ../override/R1.txt; echo; cat ../override/R2.txt; echo; } > app/src/main/java/com/aimoverlay/Rest.kt
       - uses: actions/setup-java@v4
         with:
