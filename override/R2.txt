@@ -1,3 +1,10 @@
+        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        addOverlay()
+        addBubble()
+        setupCapture()
+        return START_NOT_STICKY
+    }
+
     private fun startAsForeground() {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
@@ -171,7 +178,7 @@
             val det = detector.detect(px, w, h)
             val diag = prefs.getBoolean("diag", true)
             val st = detector.status
-            main.post { overlay?.setStatus(st, diag) }
+            main.post { overlay?.setStatus("v12 " + st, diag) }
             if (det == null) {
                 // لا نمسح فوراً: نُبقي آخر رسم لحظات قصيرة حتى لا يرفرف الخط
                 if (now - lastGood > 450L) {
@@ -189,7 +196,7 @@
                 for (i in 0 until l.size - 1) { ex.add(l[i][0]); ex.add(l[i][1]); ex.add(l[i + 1][0]); ex.add(l[i + 1][1]) }
             }
             addLine(path.obj)
-            if (showCue) { addLine(path.cue); addLine(path.deflect) }
+            if (showCue || path.free) { addLine(path.cue); addLine(path.deflect) }
             detector.exclusions = ex.toFloatArray()
             main.post { if (enabled) overlay?.update(path, w, h, showCue) }
           } catch (e: Exception) {
