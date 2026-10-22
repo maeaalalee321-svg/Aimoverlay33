@@ -3,6 +3,7 @@ package com.aimoverlay
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
@@ -96,7 +97,7 @@ class Detector {
     private fun isWhiteStrict(c: Int): Boolean {
         val g = (c shr 8) and 255
         val b = c and 255
-        return g > 205 && b > 205 && abs(g - b) < 40
+        return g > 205 && b > 205 && abs(g - b) < 40 && ((c shr 16) and 255) > 170
     }
 
     /** ألوان رسم التطبيق نفسه (سماوي/ليموني/أرجواني) بعد المزج مع الخلفية. */
@@ -379,72 +380,4 @@ class Detector {
         val t = (cx - mx.toFloat()) * tx + (cy - my.toFloat()) * ty
         return floatArrayOf(tx, ty, mx.toFloat() + tx * t, my.toFloat() + ty * t)
     }
-
-    // ------------------------------------------------------------ الكرة الهدف
-
-
-
-
-    /**
-     * يلتقط الخط الأبيض القصير الذي ترسمه اللعبة من مركز الكرة الهدف؛ هذا الخط يمرّ بمركز الكرة الهدف
-     * وبمركز الكرة الشبحية، فنجمع البكسلات البيضاء الصارمة حول الشبحية ونبحث عن أكبر عنقود مستقيم
-     * ثم نلاءمه بـ PCA متكرر. أدق بكثير من تقدير مركز الكرة بلونها.
-     * يرجع [nx, ny, ox, oy] أو null.
-     */
-    private fun findTick(
-        px: IntArray, w: Int, h: Int, r: Float, gx: Float, gy: Float, ux: Float, uy: Float
-    ): FloatArray? {
-        dbg = ""
-        val nb = 180
-        val hist = IntArray(nb)
-        val xs = ArrayList<Int>()
-        val ys = ArrayList<Int>()
-        val ya = max(0, (gy - 5f * r).toInt()); val yb = min(h - 1, (gy + 5f * r).toInt())
-        val xa = max(0, (gx - 5f * r).toInt()); val xb = min(w - 1, (gx + 5f * r).toInt())
-        val twoPi = (2.0 * Math.PI).toFloat()
-        for (y in ya..yb) for (x in xa..xb) {
-            val vx = x - gx; val vy = y - gy
-            val d2 = vx * vx + vy * vy
-            if (d2 < 3.42f * r * r || d2 > 25f * r * r) continue
-            if (!isWhiteStrict(px[y * w + x])) continue
-            val d = sqrt(d2)
-            if ((vx * ux + vy * uy) / d < -0.2f) continue          // خلف الشبحية: خط الكرة البيضاء
-            var bi = (((atan2(vy, vx) + Math.PI.toFloat()) / twoPi) * nb).toInt()
-            if (bi >= nb) bi = nb - 1
-            if (bi < 0) bi = 0
-            hist[bi]++
-            xs.add(x); ys.add(y)
-        }
-        val total = xs.size
-        if (total < 12) return null
-        val sm = IntArray(nb) { hist[it] + hist[(it + 1) % nb] + hist[(it + nb - 1) % nb] }
-        val used = ArrayList<Int>()
-        var bestN = 0
-        var res: FloatArray? = null
-        val band = BooleanArray(total)
-        for (cand in 0 until 4) {
-            var bi = -1
-            var bv = 7
-            for (i in 0 until nb) {
-                if (sm[i] <= bv) continue
-                var near = false
-                for (u in used) { val dd = abs(i - u); if (min(dd, nb - dd) <= 3) { near = true; break } }
-                if (near) continue
-                bv = sm[i]; bi = i
-            }
-            if (bi < 0) break
-            used.add(bi)
-            val phi = -Math.PI.toFloat() + (bi + 0.5f) * twoPi / nb
-            // بين حلقة الشبحية ومركز الهدف لا يوجد أبيض في خط الهدف، بخلاف خط انحراف الكرة البيضاء
-            var c = 0
-            var tot = 0
-            var t = 1.3f * r
-            while (t <= 1.9f * r) {
-                val xx = (gx + cos(phi) * t + 0.5f).toInt()
-                val yy = (gy + sin(phi) * t + 0.5f).toInt()
-                tot++
-                if (xx in 0 until w && yy in 0 until h && isWhiteStrict(px[yy * w + xx])) c++
-                t += 1f
-            }
-            if (tot > 0 && c.toFloat() / tot >= 0.4f) continue
 
